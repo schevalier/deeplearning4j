@@ -143,7 +143,7 @@ public class OutputLayer extends BaseLayer implements Serializable,Classifier {
         	gradient.gradientForVariable().put(DefaultParamInitializer.WEIGHT_KEY, input.transpose().mmul(labels.rsub(1).divi(output)));
             return new Pair<>(gradient,labelsSubOut);
             
-        case RMSE_XENT:
+        case RMSE_XENT: // root mean squared error
         	INDArray squaredrmseXentDiff = pow(labelsSubOut, 2.0);
         	INDArray sqrt = sqrt(squaredrmseXentDiff);
         	gradient.gradientForVariable().put(DefaultParamInitializer.WEIGHT_KEY, input.transpose().mmul(sqrt));

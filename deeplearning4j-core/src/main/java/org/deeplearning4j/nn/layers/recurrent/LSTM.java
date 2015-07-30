@@ -53,15 +53,19 @@ import static org.nd4j.linalg.ops.transforms.Transforms.tanh;
  *
  * Based on karpathy et. al's
  * work on generation of image descriptions.
+ * http://arxiv.org/pdf/1411.4555.pdf
+ *https://github.com/karpathy/neuraltalk/blob/master/imagernn/lstm_generator.py
  *
  * @author Adam Gibson
  */
 public class LSTM extends BaseLayer {
     //recurrent weights
-    private INDArray iFog,iFogF,c,hIn,hOut,u,u2;
-    //current input
+    private INDArray iFogZ, iFogA, memCellActivations, hIn, outputActivations;
+    // update values for drop connect
+    private INDArray u, u2;
+    //current input // paper has it as image representations
     private INDArray xi;
-    //predicted time series
+    //predicted time series // paper has it as word representations
     private INDArray xs;
 
     public LSTM(NeuralNetConfiguration conf) {
@@ -96,76 +100,72 @@ public class LSTM extends BaseLayer {
 
     /**
      * Back propagation in the given input
-     * @param y
+     * @param output
      * @return {@link org.deeplearning4j.nn.gradient.Gradient}
      */
-    public Gradient backprop(INDArray y) {
+    public Gradient backprop(INDArray output) {
+        // TODO rework as backpropGradient and determine if call activate here
         INDArray decoderWeights = getParam(LSTMParamInitializer.DECODER_WEIGHTS);
         INDArray recurrentWeights = getParam(LSTMParamInitializer.RECURRENT_WEIGHTS);
 
-        INDArray dY = Nd4j.vstack(Nd4j.zeros(y.columns()), y);
-        INDArray dWd = hOut.transpose().mmul(dY);
-        INDArray dBd = Nd4j.sum(dWd,0);
+        //add column of zeros since not used in forward pass
+        INDArray dY = Nd4j.vstack(Nd4j.zeros(output.columns()), output);
+        INDArray dWd = outputActivations.transpose().mmul(dY);
+        INDArray dBd = Nd4j.sum(dY,0);
         INDArray dHout = dY.mmul(decoderWeights.transpose());
-        if(conf.getDropOut() > 0) {
+
+        if(conf.isUseDropConnect() & conf.getDropOut() > 0)
             dHout.muli(u2);
-        }
 
-
-
-
-        INDArray dIFog = Nd4j.zeros(iFog.shape());
-        INDArray dIFogF = Nd4j.zeros(iFogF.shape());
+        INDArray dIFogZ = Nd4j.zeros(iFogZ.shape());
+        INDArray dIFogA = Nd4j.zeros(iFogA.shape());
         INDArray dRecurrentWeights = Nd4j.zeros(recurrentWeights.shape());
         INDArray dHin = Nd4j.zeros(hIn.shape());
 
-        INDArray dC = Nd4j.zeros(c.shape());
+        INDArray dC = Nd4j.zeros(memCellActivations.shape());
         INDArray dx = Nd4j.zeros(input.shape());
-        int n = hOut.rows();
-        int d = hOut.columns();
+
+        int sequenceLen = outputActivations.rows(); // n
+        int hiddenLayerSize = outputActivations.columns(); // d
 
 
-        for(int t = n -1; t > 0; t--) {
+        for(int t = sequenceLen -1; t > 0; t--) {
+
             if(conf.getActivationFunction().equals("tanh")) {
-                INDArray tanhCt = tanh(c.slice(t));
-                dIFogF.slice(t).put(new NDArrayIndex[]{interval(2 * d,3 * d)},tanhCt.mul(dHout.slice(t)));
-                dC.slice(t).addi(pow(tanhCt,2).rsubi(1).muli(iFogF.slice(t).get(interval(2 * d, 3 * d)).mul(dHout.slice(t))));
+                INDArray tanhCt = tanh(memCellActivations.slice(t)).mul(dHout.slice(t));
+                dIFogA.slice(t).put(new NDArrayIndex[]{interval(2 * hiddenLayerSize, 3 * hiddenLayerSize)}, tanhCt);
+                dC.slice(t).addi(pow(tanhCt,2).rsubi(1).muli(iFogA.slice(t).get(interval(2 * hiddenLayerSize, 3 * hiddenLayerSize)).mul(dHout.slice(t))));
             }
             else {
-                dIFogF.slice(t).put(new NDArrayIndex[]{interval(2 * d,3 * d)},c.slice(t).mul(dHout.slice(t)));
-                dC.slice(t).addi(iFogF.slice(t).get(interval(2 * d,3 * d)).mul(dHout.slice(t)));
+                dIFogA.slice(t).put(new NDArrayIndex[]{interval(2 * hiddenLayerSize, 3 * hiddenLayerSize)}, memCellActivations.slice(t).mul(dHout.slice(t)));
+                dC.slice(t).addi(iFogA.slice(t).get(interval(2 * hiddenLayerSize, 3 * hiddenLayerSize)).mul(dHout.slice(t)));
             }
 
             if(t > 0) {
-                dIFogF.slice(t).put(new NDArrayIndex[]{interval(d, 2 * d)},c.slice(t - 1).mul(dC.slice(t)));
-                dC.slice(t - 1).addi(iFogF.slice(t).get(interval(d,2 * d)).mul(dC.slice(t)));
+                dIFogA.slice(t).put(new NDArrayIndex[]{interval(hiddenLayerSize, 2 * hiddenLayerSize)}, memCellActivations.slice(t - 1).mul(dC.slice(t)));
+                dC.slice(t - 1).addi(iFogA.slice(t).get(interval(hiddenLayerSize, 2 * hiddenLayerSize)).mul(dC.slice(t)));
             }
 
-            dIFogF.slice(t).put(new NDArrayIndex[]{interval(0, d)}, iFogF.slice(t).get(interval(3 * d, iFogF.columns())).mul(dC.slice(t)));
-            dIFogF.slice(t).put(new NDArrayIndex[]{interval(3 * d, dIFogF.columns())},iFogF.slice(t).get(interval(0,d)).mul(dC.slice(t)));
+            dIFogA.slice(t).put(new NDArrayIndex[]{interval(0, hiddenLayerSize)}, iFogA.slice(t).get(interval(3 * hiddenLayerSize, iFogA.columns())).mul(dC.slice(t)));
+            dIFogA.slice(t).put(new NDArrayIndex[]{interval(3 * hiddenLayerSize, dIFogA.columns())}, iFogA.slice(t).get(interval(0,hiddenLayerSize)).mul(dC.slice(t)));
 
-            dIFog.slice(t).put(new NDArrayIndex[]{interval(3 * d,dIFog.columns())},pow(iFogF.slice(t).get(interval(3 * d,iFogF.columns())),2).rsubi(1).mul(dIFogF.slice(t).get(interval(3 * d,dIFogF.columns()))));
-            y = iFogF.slice(t).get(interval(0,3 * d));
-            dIFogF.slice(t).put(new NDArrayIndex[]{interval(0, 3 * d)}, y.mul(y.rsub(1)).mul(dIFogF.slice(t).get(interval(0, 3 * d))));
+            dIFogZ.slice(t).put(new NDArrayIndex[]{interval(3 * hiddenLayerSize, dIFogZ.columns())},pow(iFogA.slice(t).get(interval(3 * hiddenLayerSize, iFogA.columns())),2).rsubi(1).mul(dIFogA.slice(t).get(interval(3 * hiddenLayerSize, dIFogA.columns()))));
+            INDArray prediction = iFogA.slice(t).get(interval(0,3 * hiddenLayerSize));
+            dIFogZ.slice(t).put(new NDArrayIndex[]{interval(0, 3 * hiddenLayerSize)}, prediction.mul(prediction.rsub(1)).mul(dIFogA.slice(t).get(interval(0, 3 * hiddenLayerSize))));
 
-            dRecurrentWeights.addi(hIn.slice(t).transpose().mmul(dIFog.slice(t)));
-            dHin.slice(t).assign(dIFog.slice(t).mmul(recurrentWeights.transpose()));
+            dRecurrentWeights.addi(hIn.slice(t).transpose().mmul(dIFogZ.slice(t)));
+            dHin.slice(t).assign(dIFogZ.slice(t).mmul(recurrentWeights.transpose()));
 
-
-            INDArray get = dHin.slice(t).get(interval(1, 1 + d));
-
-            dx.slice(t).assign(get);
+            dx.slice(t).assign(dHin.slice(t).get(interval(1, 1 + hiddenLayerSize)));
             if(t > 0)
-                dHout.slice(t - 1).addi(dHin.slice(t).get(interval(1 + d, dHin.columns())));
+                dHout.slice(t - 1).addi(dHin.slice(t).get(interval(1 + hiddenLayerSize, dHin.columns())));
 
-
-
-            if(conf.getDropOut() > 0)
+            if(conf.isUseDropConnect() & conf.getDropOut() > 0)
                 dx.muli(u);
 
         }
 
-
+        //TODO still use this?
         clear();
 
         Gradient gradient = new DefaultGradient();
@@ -173,99 +173,93 @@ public class LSTM extends BaseLayer {
         gradient.gradientForVariable().put(LSTMParamInitializer.DECODER_WEIGHTS,dWd);
         gradient.gradientForVariable().put(LSTMParamInitializer.RECURRENT_WEIGHTS,dRecurrentWeights);
         return gradient;
-
     }
-
 
 
     @Override
     public INDArray input() {
+        // TODO include xs?
         return xi;
     }
 
     @Override
     public INDArray activate(INDArray input, boolean training){
         setInput(input, training);
+        INDArray prevOutputActivations, prevMemCellActivations;
 
-        INDArray inputWeights = getParam(LSTMParamInitializer.DECODER_WEIGHTS);
-        INDArray recurrentWeights = getParam(LSTMParamInitializer.RECURRENT_WEIGHTS);
-        INDArray biases = getParam(LSTMParamInitializer.DECODER_BIAS);
+        INDArray recurrentWeights = getParam(LSTMParamInitializer.RECURRENT_WEIGHTS); // WLSTM
+        INDArray decoderWeights = getParam(LSTMParamInitializer.DECODER_WEIGHTS);
+        INDArray bias = getParam(LSTMParamInitializer.DECODER_BIAS);
 
         if(conf.isUseDropConnect() && training) {
             if (conf.getDropOut() > 0) {
+                // TODO verfiy do we go with our applyDropconnect or use the one from Karpathy?
 //            double scale = 1 / (1 - conf.getDropOut());
 //            u = Nd4j.rand(input.shape()).lti(1 - conf.getDropOut()).muli(scale);
 //            input.muli(u);
-                inputWeights = Dropout.applyDropConnect(this, GravesLSTMParamInitializer.RECURRENT_WEIGHTS);
+                u = Dropout.applyDropout(input, conf.getDropOut(), u);
+                input.muli(u);
             }
         }
 
-        int miniBatchSize = input.rows();
-        int hiddenLayerSize = recurrentWeights.size(0);
-        int outNumSequences = inputWeights.rows();
+        int inputSequenceLen = input.rows(); // n - not miniBatch
+        int hiddenLayerSize = decoderWeights.rows(); // hidden layer size
+        int recurrentSize = recurrentWeights.size(0);
 
-        INDArray inputBias = biases.get(interval(0, hiddenLayerSize));
-        INDArray outputBias = biases.get(interval(hiddenLayerSize, 2*hiddenLayerSize));
-
-
-        //xt, ht-1, bias
-        hIn = Nd4j.zeros(miniBatchSize, hiddenLayerSize);
         //Allocate arrays for activations:
+        //xt, ht-1, bias - input activations
+        hIn = Nd4j.zeros(inputSequenceLen, recurrentSize);
+        //hOUt hidden layer output activations
+        outputActivations = Nd4j.zeros(inputSequenceLen, hiddenLayerSize);
+        // C memCellActivations
+        memCellActivations = Nd4j.zeros(inputSequenceLen, hiddenLayerSize);
 
-        INDArray outputActivations = Nd4j.zeros(new int[]{miniBatchSize,hiddenLayerSize});
-        hOut = Nd4j.zeros(miniBatchSize, outNumSequences);
-
-        INDArray iFogZ = Nd4j.zeros(new int[]{miniBatchSize, 4 * hiddenLayerSize});
-        iFog = Nd4j.zeros(miniBatchSize, outNumSequences * 4);
-
-        INDArray iFogA = Nd4j.zeros(new int[]{miniBatchSize, 4 * hiddenLayerSize});
-        iFogF = Nd4j.zeros(iFog.shape());
-
-        INDArray memCellActivations = Nd4j.zeros(new int[]{miniBatchSize, hiddenLayerSize});
-        c = Nd4j.zeros(miniBatchSize, outNumSequences);
+        // iFog linear transformation w/ no bias
+        iFogZ = Nd4j.zeros(inputSequenceLen, hiddenLayerSize * 4);
+        // iFogF activations
+        iFogA = Nd4j.zeros(inputSequenceLen, hiddenLayerSize * 4);
 
 
-        INDArray prev;
+        for(int t = 0; t < inputSequenceLen ; t++) {
+            prevOutputActivations = t == 0 ? Nd4j.zeros(hiddenLayerSize) : outputActivations.getRow(t - 1);
+            prevMemCellActivations = t == 0 ? Nd4j.zeros(hiddenLayerSize) : memCellActivations.getRow(t - 1);
 
-        for(int t = 0; t < miniBatchSize ; t++) {
-            prev = t == 0 ? Nd4j.zeros(outNumSequences) : hOut.getRow(t - 1);
             hIn.put(t, 0, 1.0);
-            hIn.slice(t).put(new NDArrayIndex[]{interval(1, 1 + outNumSequences)}, input.slice(t));
-            hIn.slice(t).put(new NDArrayIndex[]{interval(1 + outNumSequences, hIn.columns())},prev);
+            hIn.slice(t).put(new NDArrayIndex[]{interval(1, 1 + hiddenLayerSize)}, input.slice(t));
+            hIn.slice(t).put(new NDArrayIndex[]{interval(1 + hiddenLayerSize, 2 * hiddenLayerSize + 1)}, prevOutputActivations);
 
-            // TODO update iFog as iFogZ and iFogF as iFogA
+            //compute all gate linear transformations
+            iFogZ.putRow(t, hIn.slice(t).mmul(recurrentWeights));
 
-            //compute all gate activations. dots:
-            iFog.putRow(t,hIn.slice(t).mmul(recurrentWeights));
+            //store activations for i, f, o
+            iFogA.slice(t).put(new NDArrayIndex[]{interval(0, 3 * hiddenLayerSize)}, sigmoid(iFogZ.slice(t).get(new NDArrayIndex[]{interval(0, 3 * hiddenLayerSize)})));
 
-            // TODO update applying the activation function
-            //non linearity
-            iFogF.slice(t).put(new NDArrayIndex[]{interval(0,3 * outNumSequences)}, sigmoid(iFog.slice(t).get(interval(0, 3 * outNumSequences))));
-            iFogF.slice(t).put(new NDArrayIndex[]{interval(3 * outNumSequences, iFogF.columns() - 1)}, tanh(iFog.slice(t).get(interval(3 * outNumSequences, iFog.columns() - 1))));
+            // store activations for c
+            iFogA.slice(t).put(new NDArrayIndex[]{interval(3 * hiddenLayerSize, iFogA.columns() - 1)},
+                    tanh(iFogZ.slice(t).get(interval(3 * hiddenLayerSize, iFogZ.columns() - 1))));
 
-            //cell activations
-            INDArray cPut = iFogF.slice(t).get(interval(0, outNumSequences)).mul(iFogF.slice(t).get(interval(3 * outNumSequences, iFogF.columns())));
-            c.putRow(t,cPut);
+            //i dot product h(WcxXt + WcmMt-1)
+            memCellActivations.putRow(t, iFogA.slice(t).get(interval(0, hiddenLayerSize)).mul(iFogA.slice(t).get(interval(3 * hiddenLayerSize, iFogA.columns()))));
 
             if(t > 0)
-                c.slice(t).addi(iFogF.slice(t).get(interval(outNumSequences, 2 * outNumSequences)).mul(c.getRow(t - 1)));
+                // Ct curr memory cell activations after t 0
+                memCellActivations.slice(t).addi(iFogA.slice(t).get(interval(hiddenLayerSize, 2 * hiddenLayerSize)).mul(prevMemCellActivations));
 
-            // TODO update applying the activation function
-            if(conf.getActivationFunction().equals("tanh"))
-                hOut.slice(t).assign(iFogF.slice(t).get(interval(2 * outNumSequences, 3 * outNumSequences)).mul(tanh(c.getRow(t))));
-            else
-                hOut.slice(t).assign(iFogF.slice(t).get(interval(2 * outNumSequences, 3 * outNumSequences)).mul(c.getRow(t)));
-
+            // mt hidden out or output before activation
+            if(conf.getActivationFunction().equals("tanh")) {
+                outputActivations.slice(t).assign(iFogA.slice(t).get(interval(2 * hiddenLayerSize, 3 * hiddenLayerSize)).mul(tanh(memCellActivations.getRow(t))));
+            } else {
+                outputActivations.slice(t).assign(iFogA.slice(t).get(interval(2 * hiddenLayerSize, 3 * hiddenLayerSize)).mul(memCellActivations.getRow(t)));
+            }
         }
 
-        if(conf.getDropOut() > 0) {
-            u2 = Dropout.applyDropout(hOut,conf.getDropOut(),u2);
+        if(conf.isUseDropConnect() && training) {
+            if (conf.getDropOut() > 0) {
+                u2 = Dropout.applyDropout(outputActivations, conf.getDropOut(), u2);
+                outputActivations.muli(u2);
+            }
         }
-
-
-        INDArray outputActivations = hOut.get(interval(1, hOut.rows())).mmul(inputWeights).addiRowVector(outputBias);
-        return y;
-
+        return outputActivations.get(interval(1, outputActivations.rows())).mmul(decoderWeights).addiRowVector(bias);
 
     }
 
@@ -288,10 +282,10 @@ public class LSTM extends BaseLayer {
     public  void clear() {
         u = null;
         hIn = null;
-        hOut = null;
-        iFog = null;
-        iFogF = null;
-        c = null;
+        outputActivations = null;
+        iFogZ = null;
+        iFogA = null;
+        memCellActivations = null;
         input = null;
         u2 = null;
     }
@@ -457,17 +451,17 @@ public class LSTM extends BaseLayer {
         INDArray c = Nd4j.zeros(d);
         iFog.putScalar(t,hIn.slice(t).mmul(recurrentWeights).getDouble(0));
         NDArrayIndex[] indices = new NDArrayIndex[]{interval(0,3 * d)};
-        iFogf.slice(t).put(indices,sigmoid(iFogF.slice(t).get(indices)));
+        iFogf.slice(t).put(indices,sigmoid(iFogA.slice(t).get(indices)));
         NDArrayIndex[] after = new NDArrayIndex[]{interval(3 * d,iFogf.columns())};
         iFogf.slice(t).put(after,tanh(iFogf.slice(t).get(after)));
         c.slice(t).assign(iFogf.slice(t).get(interval(0,d)).mul(iFogf.slice(t).get(interval(3 * d,iFogf.columns()))).addi(iFogf.slice(t).get(interval(d, 2 * d))).muli(cPrev));
 
         if(conf.getActivationFunction().equals("tanh"))
-            hOut.slice(t).assign(iFogf.slice(t).get(interval(2 * d,3 * d)).mul(tanh(c.slice(t))));
+            outputActivations.slice(t).assign(iFogf.slice(t).get(interval(2 * d,3 * d)).mul(tanh(c.slice(t))));
         else
-            hOut.slice(t).assign(iFogf.slice(t).get(interval(2 * d,3 * d)).mul(c.slice(t)));
-        INDArray y = hOut.mmul(decoderWeights).addiRowVector(decoderBias);
-        return new Triple<>(y,hOut,c);
+            outputActivations.slice(t).assign(iFogf.slice(t).get(interval(2 * d,3 * d)).mul(c.slice(t)));
+        INDArray y = outputActivations.mmul(decoderWeights).addiRowVector(decoderBias);
+        return new Triple<>(y, outputActivations, c);
 
 
     }
