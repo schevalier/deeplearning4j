@@ -14,7 +14,7 @@
 
 
     <properties>
-        <spring.version>3.2.5.RELEASE</spring.version>
+        <spring.version>5.2.24.RELEASE</spring.version>
         <google.protobuf.version>2.6.1</google.protobuf.version>
         <lombok.version>1.16.4</lombok.version>
     </properties>
